@@ -56,16 +56,18 @@ export class AudioStreamer {
         "audio-capture-processor"
       );
 
-      // Set up message handling from the worklet
       this.audioWorklet.port.onmessage = (event) => {
         if (!this.isStreaming) return;
 
         if (event.data.type === "audio") {
-          const inputData = event.data.data;
+          let inputData = event.data.data;
+          const inputRate = this.audioContext.sampleRate;
+          if (inputRate !== this.sampleRate) {
+            inputData = this.resample(inputData, inputRate, this.sampleRate);
+          }
           const pcmData = this.convertToPCM16(inputData);
           const base64Audio = this.arrayBufferToBase64(pcmData);
 
-          // Send to Gemini
           if (this.client && this.client.connected) {
             this.client.sendAudioMessage(base64Audio);
           }
@@ -112,9 +114,21 @@ export class AudioStreamer {
     console.log("🛑 Audio streaming stopped");
   }
 
-  /**
-   * Convert Float32Array to PCM16 Int16Array
-   */
+  resample(float32Array, fromRate, toRate) {
+    if (fromRate === toRate) return float32Array;
+    const ratio = fromRate / toRate;
+    const outputLength = Math.floor(float32Array.length / ratio);
+    const result = new Float32Array(outputLength);
+    for (let i = 0; i < outputLength; i++) {
+      const srcIndex = i * ratio;
+      const srcIndexFloor = Math.floor(srcIndex);
+      const srcIndexCeil = Math.min(srcIndexFloor + 1, float32Array.length - 1);
+      const frac = srcIndex - srcIndexFloor;
+      result[i] = float32Array[srcIndexFloor] * (1 - frac) + float32Array[srcIndexCeil] * frac;
+    }
+    return result;
+  }
+
   convertToPCM16(float32Array) {
     const int16Array = new Int16Array(float32Array.length);
     for (let i = 0; i < float32Array.length; i++) {
@@ -185,10 +199,9 @@ class BaseVideoCapture {
    * Start capturing and sending frames
    */
   startCapturing() {
-    const captureFrame = () => {
+    let lastSendTime = 0;
+    const captureAndSend = () => {
       if (!this.isStreaming) return;
-
-      // Draw current frame to canvas
       this.ctx.drawImage(
         this.video,
         0,
@@ -196,28 +209,27 @@ class BaseVideoCapture {
         this.canvas.width,
         this.canvas.height
       );
-
-      // Convert to JPEG and send
-      this.canvas.toBlob(
-        (blob) => {
-          if (!blob) return;
-
-          const reader = new FileReader();
-          reader.onloadend = () => {
-            const base64 = reader.result.split(",")[1];
-            if (this.client && this.client.connected) {
-              this.client.sendImageMessage(base64, "image/jpeg");
-            }
-          };
-          reader.readAsDataURL(blob);
-        },
-        "image/jpeg",
-        this.quality
-      );
+      const now = Date.now();
+      if (now - lastSendTime >= 1000) {
+        lastSendTime = now;
+        this.canvas.toBlob(
+          (blob) => {
+            if (!blob) return;
+            const reader = new FileReader();
+            reader.onloadend = () => {
+              const base64 = reader.result.split(",")[1];
+              if (this.client && this.client.connected) {
+                this.client.sendImageMessage(base64, "image/jpeg");
+              }
+            };
+            reader.readAsDataURL(blob);
+          },
+          "image/jpeg",
+          this.quality
+        );
+      }
     };
-
-    // Start interval
-    this.captureInterval = setInterval(captureFrame, 1000 / this.fps);
+    this.captureInterval = setInterval(captureAndSend, 300);
   }
 
   /**
@@ -393,7 +405,8 @@ export class AudioPlayer {
     this.gainNode = null;
     this.isInitialized = false;
     this.volume = 1.0;
-    this.sampleRate = 24000; // Gemini outputs at 24kHz
+    this.sampleRate = 24000;
+    this.playbackEndTime = null;
   }
 
   /**
@@ -464,7 +477,13 @@ export class AudioPlayer {
         float32Data[i] = inputArray[i] / 32768;
       }
 
-      // Send to worklet for playback
+      const dur = float32Data.length / this.sampleRate;
+      const now = this.audioContext.currentTime;
+      this.playbackEndTime = Math.max(
+        this.playbackEndTime ?? now,
+        now
+      ) + dur;
+
       this.workletNode.port.postMessage(float32Data);
     } catch (error) {
       console.error("Error playing audio chunk:", error);
@@ -472,10 +491,34 @@ export class AudioPlayer {
     }
   }
 
-  /**
-   * Interrupt current playback
-   */
+  waitForPlaybackIdle() {
+    return new Promise((resolve) => {
+      if (!this.audioContext) {
+        resolve();
+        return;
+      }
+      const margin = 0.05;
+      const tick = () => {
+        if (!this.audioContext) {
+          resolve();
+          return;
+        }
+        const now = this.audioContext.currentTime;
+        const end = this.playbackEndTime ?? now;
+        if (now >= end - margin) {
+          resolve();
+        } else {
+          requestAnimationFrame(tick);
+        }
+      };
+      tick();
+    });
+  }
+
   interrupt() {
+    if (this.audioContext) {
+      this.playbackEndTime = this.audioContext.currentTime;
+    }
     if (this.workletNode) {
       this.workletNode.port.postMessage("interrupt");
     }
@@ -499,6 +542,7 @@ export class AudioPlayer {
       this.audioContext.close();
       this.audioContext = null;
     }
+    this.playbackEndTime = null;
     this.isInitialized = false;
   }
 }

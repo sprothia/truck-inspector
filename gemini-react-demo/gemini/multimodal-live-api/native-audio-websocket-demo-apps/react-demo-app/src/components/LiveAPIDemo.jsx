@@ -3,204 +3,116 @@ import { GeminiLiveAPI, MultimodalLiveResponseType } from "../utils/gemini-api";
 import {
   AudioStreamer,
   VideoStreamer,
-  ScreenCapture,
   AudioPlayer,
 } from "../utils/media-utils";
-import { ShowAlertTool, AddCSSStyleTool } from "../utils/tools";
+import { INSPECTION_CHECKLIST } from "../data/inspectionChecklist";
+import { INSPECTION_SYSTEM_INSTRUCTIONS } from "../utils/inspectionPrompts";
+import { APP_CONFIG } from "../config";
 import "./LiveAPIDemo.css";
 
 const LiveAPIDemo = () => {
-  // Connection State
+  const [inspectionStep, setInspectionStep] = useState(0);
+  const [inspectionResults, setInspectionResults] = useState([]);
+  const outputTranscriptRef = useRef("");
+  const inspectionKickoffSent = useRef(false);
+  const pendingVerdictRef = useRef(null);
+  const inspectionStepRef = useRef(0);
+
   const [connected, setConnected] = useState(false);
-  const [debugInfo, setDebugInfo] = useState("Ready to connect...");
-  const [setupJson, setSetupJson] = useState(null);
+  const [debugInfo, setDebugInfo] = useState("Ready");
 
-  // Configuration State
-  const getDefaultProxyUrl = () => {
-    const stored = localStorage.getItem("proxyUrl");
-    if (stored) return stored;
-    if (typeof window !== "undefined" && window.Capacitor?.isNativePlatform?.()) {
-      return "";
-    }
-    return "ws://localhost:8080";
-  };
-  const [proxyUrl, setProxyUrl] = useState(getDefaultProxyUrl);
-  const [projectId, setProjectId] = useState(
-    localStorage.getItem("projectId") || ""
-  );
-  const [model, setModel] = useState(
-    localStorage.getItem("model") ||
-      "gemini-live-2.5-flash-native-audio"
-  );
-
-  useEffect(() => {
-    localStorage.setItem("proxyUrl", proxyUrl);
-    localStorage.setItem("projectId", projectId);
-    localStorage.setItem("model", model);
-  }, [proxyUrl, projectId, model]);
-  const [systemInstructions, setSystemInstructions] = useState(
-    "You are a helpful assistant. Be concise and friendly."
-  );
-  const [voice, setVoice] = useState("Puck");
-  const [temperature, setTemperature] = useState(1.0);
-  const [enableProactiveAudio, setEnableProactiveAudio] = useState(true);
-  const [enableGrounding, setEnableGrounding] = useState(false);
-  const [enableAffectiveDialog, setEnableAffectiveDialog] = useState(true);
-  const [enableAlertTool, setEnableAlertTool] = useState(true);
-  const [enableCssStyleTool, setEnableCssStyleTool] = useState(true);
-  const [enableInputTranscription, setEnableInputTranscription] =
-    useState(true);
-  const [enableOutputTranscription, setEnableOutputTranscription] =
-    useState(true);
-
-  // Activity Detection State
-  const [disableActivityDetection, setDisableActivityDetection] =
-    useState(false);
-  const [silenceDuration, setSilenceDuration] = useState(500);
-  const [prefixPadding, setPrefixPadding] = useState(500);
-  const [endSpeechSensitivity, setEndSpeechSensitivity] = useState(
-    "END_SENSITIVITY_UNSPECIFIED"
-  );
-  const [startSpeechSensitivity, setStartSpeechSensitivity] = useState(
-    "START_SENSITIVITY_UNSPECIFIED"
-  );
-
-  // Media State
-  const [audioStreaming, setAudioStreaming] = useState(false);
-  const [videoStreaming, setVideoStreaming] = useState(false);
-  const [screenSharing, setScreenSharing] = useState(false);
-  const [volume, setVolume] = useState(80);
-  const [audioInputDevices, setAudioInputDevices] = useState([]);
-  const [videoInputDevices, setVideoInputDevices] = useState([]);
-  const [selectedMic, setSelectedMic] = useState("");
-  const [selectedCamera, setSelectedCamera] = useState("");
-
-  // Chat State
-  const [chatMessages, setChatMessages] = useState([]);
-  const [chatInput, setChatInput] = useState("");
-
-  // Refs
   const clientRef = useRef(null);
   const audioStreamerRef = useRef(null);
   const videoStreamerRef = useRef(null);
-  const screenCaptureRef = useRef(null);
   const audioPlayerRef = useRef(null);
   const videoPreviewRef = useRef(null);
-  const chatContainerRef = useRef(null);
 
-  // Initialize Media Devices
   useEffect(() => {
-    const getDevices = async () => {
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        setAudioInputDevices(
-          devices.filter((device) => device.kind === "audioinput")
-        );
-        setVideoInputDevices(
-          devices.filter((device) => device.kind === "videoinput")
-        );
-      } catch (error) {
-        console.error("Error enumerating devices:", error);
-      }
-    };
-    getDevices();
-  }, []);
+    inspectionStepRef.current = inspectionStep;
+  }, [inspectionStep]);
 
-  // Scroll to bottom of chat
-  useEffect(() => {
-    if (chatContainerRef.current) {
-      chatContainerRef.current.scrollTop =
-        chatContainerRef.current.scrollHeight;
-    }
-  }, [chatMessages]);
-
-  const addMessage = (text, type, mode = "add", isFinished = false) => {
-    setChatMessages((prev) => {
-      // Check if we can modify the last message
-      if (
-        mode !== "add" &&
-        prev.length > 0 &&
-        prev[prev.length - 1].type === type &&
-        !prev[prev.length - 1].isFinished
-      ) {
-        const newMessages = [...prev];
-        // Create a shallow copy of the message to avoid mutating state directly
-        const target = { ...newMessages[newMessages.length - 1] };
-        newMessages[newMessages.length - 1] = target;
-
-        if (mode === "append") {
-          target.text += text;
-        } else if (mode === "replace") {
-          // Only replace if text is provided and not just whitespace
-          if (text && text.trim().length > 0) {
-            target.text = text;
-          }
-        }
-
-        if (isFinished) {
-          target.isFinished = true;
-        }
-        return newMessages;
-      }
-
-      // Create new message
-      // Don't create empty messages
-      if ((!text || text.trim().length === 0) && !isFinished) return prev;
-
-      return [...prev, { text: text || "", type, isFinished }];
-    });
+  const parsePassFail = (text, currentItemName) => {
+    const lower = text.toLowerCase();
+    if (/\b(don't|dont|can't|cant|won't|wont|not|to|we|i)\s+pass\b/i.test(lower)) return null;
+    if (/\b(don't|dont|can't|cant|won't|wont|not)\s+fail\b/i.test(lower)) return null;
+    const passMatch = lower.match(/\bpass\b[.:,]?\s*(.*)/);
+    const failMatch = lower.match(/\bfail\b[.:,]?\s*(.*)/);
+    const itemWords = (currentItemName || "").toLowerCase().split(/[\s_&]+/).filter((w) => w.length > 2);
+    const hasItemMention = itemWords.length === 0 || itemWords.some((w) => lower.includes(w));
+    if (passMatch && hasItemMention) return { pass: true, reason: passMatch[1].trim() || "Passed inspection" };
+    if (failMatch && hasItemMention) return { pass: false, reason: failMatch[1].trim() || "Failed inspection" };
+    return null;
   };
 
   const handleMessage = (message) => {
     setDebugInfo(`Message: ${message.type}`);
 
     switch (message.type) {
-      case MultimodalLiveResponseType.TEXT:
-        addMessage(message.data, "assistant");
-        break;
       case MultimodalLiveResponseType.AUDIO:
         if (audioPlayerRef.current) {
           audioPlayerRef.current.play(message.data);
         }
         break;
-      case MultimodalLiveResponseType.INPUT_TRANSCRIPTION:
-        addMessage(
-          message.data.text,
-          "user-transcript",
-          "append",
-          message.data.finished
-        );
-        break;
       case MultimodalLiveResponseType.OUTPUT_TRANSCRIPTION:
-        addMessage(
-          message.data.text,
-          "assistant",
-          "append",
-          message.data.finished
-        );
+        outputTranscriptRef.current += message.data.text;
+        if (message.data.finished) {
+          const fullText = outputTranscriptRef.current;
+          outputTranscriptRef.current = "";
+          const s = inspectionStepRef.current;
+          if (s < INSPECTION_CHECKLIST.length) {
+            const item = INSPECTION_CHECKLIST[s];
+            const parsed = parsePassFail(fullText, item.name);
+            if (parsed) {
+              pendingVerdictRef.current = { stepId: item.id, ...parsed };
+            }
+          }
+        }
         break;
       case MultimodalLiveResponseType.SETUP_COMPLETE:
-        addMessage("Ready!", "system");
-        if (clientRef.current && clientRef.current.lastSetupMessage) {
-          setSetupJson(clientRef.current.lastSetupMessage);
+        if (!inspectionKickoffSent.current) {
+          inspectionKickoffSent.current = true;
+          setTimeout(() => {
+            if (clientRef.current) {
+              clientRef.current.sendTextMessage("Please begin the inspection with an introduction.");
+            }
+          }, 1500);
         }
         break;
       case MultimodalLiveResponseType.TOOL_CALL: {
         const functionCalls = message.data.functionCalls;
         functionCalls.forEach((functionCall) => {
           const { name, args } = functionCall;
-          console.log(
-            `Calling function ${name} with parameters: ${JSON.stringify(args)}`
-          );
           clientRef.current.callFunction(name, args);
         });
         break;
       }
       case MultimodalLiveResponseType.TURN_COMPLETE:
-        setDebugInfo("Turn complete");
+        if (pendingVerdictRef.current) {
+          const verdict = pendingVerdictRef.current;
+          pendingVerdictRef.current = null;
+          void (async () => {
+            if (audioPlayerRef.current) {
+              await audioPlayerRef.current.waitForPlaybackIdle();
+            }
+            setInspectionResults((r) => [...r, verdict]);
+            setInspectionStep((s) => {
+              const nextStep = Math.min(s + 1, INSPECTION_CHECKLIST.length);
+              if (nextStep < INSPECTION_CHECKLIST.length && clientRef.current) {
+                const nextItem = INSPECTION_CHECKLIST[nextStep];
+                setTimeout(() => {
+                  if (clientRef.current?.connected) {
+                    clientRef.current.sendTextMessage(
+                      `Next item: ${nextItem.name}. Ask the driver to show the ${nextItem.name} for a fresh inspection - do not use frames from the previous step.`
+                    );
+                  }
+                }, 300);
+              }
+              return nextStep;
+            });
+          })();
+        }
         break;
       case MultimodalLiveResponseType.INTERRUPTED:
-        addMessage("[Interrupted]", "system");
         if (audioPlayerRef.current) {
           audioPlayerRef.current.interrupt();
         }
@@ -215,7 +127,6 @@ const LiveAPIDemo = () => {
       clientRef.current.disconnect();
       clientRef.current = null;
     }
-
     if (audioStreamerRef.current) {
       audioStreamerRef.current.stop();
       audioStreamerRef.current = null;
@@ -224,19 +135,16 @@ const LiveAPIDemo = () => {
       videoStreamerRef.current.stop();
       videoStreamerRef.current = null;
     }
-    if (screenCaptureRef.current) {
-      screenCaptureRef.current.stop();
-      screenCaptureRef.current = null;
-    }
     if (audioPlayerRef.current) {
       audioPlayerRef.current.destroy();
       audioPlayerRef.current = null;
     }
 
     setConnected(false);
-    setAudioStreaming(false);
-    setVideoStreaming(false);
-    setScreenSharing(false);
+    inspectionKickoffSent.current = false;
+    pendingVerdictRef.current = null;
+    setInspectionStep(0);
+    setInspectionResults([]);
 
     if (videoPreviewRef.current) {
       videoPreviewRef.current.srcObject = null;
@@ -244,528 +152,164 @@ const LiveAPIDemo = () => {
     }
   };
 
-  // Cleanup on unmount
   useEffect(() => {
-    return () => {
-      disconnect();
-    };
+    return () => disconnect();
   }, []);
 
   const connect = async () => {
-    if (!proxyUrl && !projectId) {
-      alert("Please provide either a Proxy URL and Project ID");
+    const { proxyUrl, projectId, model, voice, volume } = APP_CONFIG;
+
+    if (!proxyUrl || !projectId) {
+      alert("Set VITE_PROXY_URL and VITE_PROJECT_ID in .env (see .env.example)");
       return;
     }
 
     try {
+      setInspectionStep(0);
+      setInspectionResults([]);
+
       clientRef.current = new GeminiLiveAPI(proxyUrl, projectId, model);
 
-      clientRef.current.systemInstructions = systemInstructions;
-      clientRef.current.inputAudioTranscription = enableInputTranscription;
-      clientRef.current.outputAudioTranscription = enableOutputTranscription;
-      clientRef.current.googleGrounding = enableGrounding;
-      clientRef.current.enableAffectiveDialog = enableAffectiveDialog;
+      clientRef.current.systemInstructions = INSPECTION_SYSTEM_INSTRUCTIONS;
+      clientRef.current.inputAudioTranscription = true;
+      clientRef.current.outputAudioTranscription = true;
+      clientRef.current.googleGrounding = false;
+      clientRef.current.enableAffectiveDialog = true;
       clientRef.current.responseModalities = ["AUDIO"];
       clientRef.current.voiceName = voice;
-      clientRef.current.temperature = parseFloat(temperature);
-      clientRef.current.proactivity = {
-        proactiveAudio: enableProactiveAudio,
-      };
+      clientRef.current.temperature = 1.0;
+      clientRef.current.proactivity = { proactiveAudio: true };
       clientRef.current.automaticActivityDetection = {
-        disabled: disableActivityDetection,
-        silence_duration_ms: parseInt(silenceDuration),
-        prefix_padding_ms: parseInt(prefixPadding),
-        end_of_speech_sensitivity: endSpeechSensitivity,
-        start_of_speech_sensitivity: startSpeechSensitivity,
+        disabled: false,
+        silence_duration_ms: 400,
+        prefix_padding_ms: 300,
+        end_of_speech_sensitivity: "END_SENSITIVITY_HIGH",
+        start_of_speech_sensitivity: "START_SENSITIVITY_LOW",
       };
-
-      if (!enableGrounding) {
-        if (enableAlertTool) {
-          clientRef.current.addFunction(new ShowAlertTool());
-        }
-        if (enableCssStyleTool) {
-          clientRef.current.addFunction(new AddCSSStyleTool());
-        }
-      }
 
       clientRef.current.onReceiveResponse = handleMessage;
       clientRef.current.onErrorMessage = (error) => {
-        console.error("Error:", error);
         setDebugInfo("Error: " + error);
       };
-      clientRef.current.onConnectionStarted = () => {
-        setConnected(true);
-      };
-      clientRef.current.onClose = () => {
-        setConnected(false);
-        disconnect();
-      };
+      clientRef.current.onConnectionStarted = () => setConnected(true);
+      clientRef.current.onClose = () => disconnect();
 
       await clientRef.current.connect();
 
       audioStreamerRef.current = new AudioStreamer(clientRef.current);
       videoStreamerRef.current = new VideoStreamer(clientRef.current);
-      screenCaptureRef.current = new ScreenCapture(clientRef.current);
       audioPlayerRef.current = new AudioPlayer();
       await audioPlayerRef.current.init();
       audioPlayerRef.current.setVolume(volume / 100);
 
-      setDebugInfo("Connected successfully");
+      await audioStreamerRef.current.start();
+      const video = await videoStreamerRef.current.start({
+        facingMode: "environment",
+      });
+      if (videoPreviewRef.current) {
+        videoPreviewRef.current.srcObject = video.srcObject;
+      }
+
+      setDebugInfo("Connected");
     } catch (error) {
-      console.error("Connection failed:", error);
       setDebugInfo("Error: " + error.message);
     }
   };
 
-  const toggleAudio = async () => {
-    if (!audioStreaming) {
-      try {
-        if (!audioStreamerRef.current && clientRef.current) {
-          audioStreamerRef.current = new AudioStreamer(clientRef.current);
-        }
-
-        if (audioStreamerRef.current) {
-          await audioStreamerRef.current.start(selectedMic);
-          setAudioStreaming(true);
-          addMessage("[Microphone on]", "system");
-        } else {
-          addMessage("[Connect to Gemini first]", "system");
-        }
-      } catch (error) {
-        addMessage("[Audio error: " + error.message + "]", "system");
-      }
-    } else {
-      if (audioStreamerRef.current) audioStreamerRef.current.stop();
-      setAudioStreaming(false);
-      addMessage("[Microphone off]", "system");
-    }
-  };
-
-  const toggleVideo = async () => {
-    if (!videoStreaming) {
-      try {
-        if (!videoStreamerRef.current && clientRef.current) {
-          videoStreamerRef.current = new VideoStreamer(clientRef.current);
-        }
-
-        if (videoStreamerRef.current) {
-          const video = await videoStreamerRef.current.start({
-            deviceId: selectedCamera,
-          });
-          setVideoStreaming(true);
-          if (videoPreviewRef.current) {
-            videoPreviewRef.current.srcObject = video.srcObject;
-            videoPreviewRef.current.hidden = false;
-          }
-          addMessage("[Camera on]", "system");
-        } else {
-          addMessage("[Connect to Gemini first]", "system");
-        }
-      } catch (error) {
-        addMessage("[Video error: " + error.message + "]", "system");
-      }
-    } else {
-      if (videoStreamerRef.current) videoStreamerRef.current.stop();
-      setVideoStreaming(false);
-      if (videoPreviewRef.current) {
-        videoPreviewRef.current.srcObject = null;
-        videoPreviewRef.current.hidden = true;
-      }
-      addMessage("[Camera off]", "system");
-    }
-  };
-
-  const toggleScreen = async () => {
-    if (!screenSharing) {
-      try {
-        if (!screenCaptureRef.current && clientRef.current) {
-          screenCaptureRef.current = new ScreenCapture(clientRef.current);
-        }
-
-        if (screenCaptureRef.current) {
-          const video = await screenCaptureRef.current.start();
-          setScreenSharing(true);
-          if (videoPreviewRef.current) {
-            videoPreviewRef.current.srcObject = video.srcObject;
-            videoPreviewRef.current.hidden = false;
-          }
-          addMessage("[Screen sharing on]", "system");
-        } else {
-          addMessage("[Connect to Gemini first]", "system");
-        }
-      } catch (error) {
-        addMessage("[Screen share error: " + error.message + "]", "system");
-      }
-    } else {
-      if (screenCaptureRef.current) screenCaptureRef.current.stop();
-      setScreenSharing(false);
-      if (!videoStreaming && videoPreviewRef.current) {
-        videoPreviewRef.current.srcObject = null;
-        videoPreviewRef.current.hidden = true;
-      }
-      addMessage("[Screen sharing off]", "system");
-    }
-  };
-
-  const sendMessage = () => {
-    if (!chatInput.trim()) return;
-
-    if (clientRef.current) {
-      addMessage(chatInput, "user");
-      clientRef.current.sendTextMessage(chatInput);
-      setChatInput("");
-    } else {
-      addMessage("[Connect to Gemini first]", "system");
-    }
-  };
-
-  const handleVolumeChange = (e) => {
-    const newVolume = e.target.value;
-    setVolume(newVolume);
-    if (audioPlayerRef.current) {
-      audioPlayerRef.current.setVolume(newVolume / 100);
-    }
-  };
+  const inspectionComplete = inspectionStep >= INSPECTION_CHECKLIST.length;
 
   return (
     <div className="live-api-demo">
-      <div className="main-screen">
-        <h1 className="app-title">Gemini Live</h1>
-        <button
-          onClick={connected ? disconnect : connect}
-          className={`button-connect ${connected ? "disconnect" : "active"}`}
-        >
-          {connected ? "Disconnect" : "Connect"}
-        </button>
-        <div className="controls-row">
-          <div className="dropdown">
-            <button className="dropbtn">Config ▾</button>
-            <div className="dropdown-content config-dropdown">
-              {/* API Configuration Section */}
-              <div className="control-group">
-                <h3>Connection Settings</h3>
-                <div className="input-group">
-                  <label>Proxy WebSocket URL:</label>
-                  <input
-                    type="text"
-                    value={proxyUrl}
-                    onChange={(e) => setProxyUrl(e.target.value)}
-                    placeholder={window.Capacitor?.isNativePlatform?.() ? "ws://YOUR_MAC_IP:8080" : "ws://localhost:8080"}
-                    disabled={connected}
-                  />
-                </div>
-                <div className="input-group">
-                  <label>Project ID:</label>
-                  <input
-                    type="text"
-                    value={projectId}
-                    onChange={(e) => setProjectId(e.target.value)}
-                    disabled={connected}
-                  />
-                </div>
-                <div className="input-group">
-                  <label>Model ID:</label>
-                  <input
-                    type="text"
-                    value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    disabled={connected}
-                  />
-                </div>
-              </div>
-
-              <div className="control-group">
-                <h3>Gemini Behavior</h3>
-                <div className="input-group">
-                  <label>System Instructions:</label>
-                  <textarea
-                    rows="3"
-                    value={systemInstructions}
-                    onChange={(e) => setSystemInstructions(e.target.value)}
-                    disabled={connected}
-                  />
-                </div>
-                <div className="input-group">
-                  <label>Voice:</label>
-                  <select
-                    value={voice}
-                    onChange={(e) => setVoice(e.target.value)}
-                    disabled={connected}
-                  >
-                    <option value="Puck">Puck (Default)</option>
-                    <option value="Charon">Charon</option>
-                    <option value="Kore">Kore</option>
-                    <option value="Fenrir">Fenrir</option>
-                    <option value="Aoede">Aoede</option>
-                  </select>
-                </div>
-                <div className="input-group">
-                  <label>Temperature: {temperature}</label>
-                  <input
-                    type="range"
-                    min="0.1"
-                    max="2.0"
-                    step="0.1"
-                    value={temperature}
-                    onChange={(e) => setTemperature(e.target.value)}
-                    disabled={connected}
-                  />
-                </div>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableProactiveAudio}
-                    onChange={(e) => setEnableProactiveAudio(e.target.checked)}
-                    disabled={connected}
-                  />
-                  <label>Enable proactive audio</label>
-                </div>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableGrounding}
-                    onChange={(e) => setEnableGrounding(e.target.checked)}
-                    disabled={connected}
-                  />
-                  <label>Enable Google grounding</label>
-                </div>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableAffectiveDialog}
-                    onChange={(e) => setEnableAffectiveDialog(e.target.checked)}
-                    disabled={connected}
-                  />
-                  <label>Enable affective dialog</label>
-                </div>
-              </div>
-
-              <div className="control-group">
-                <h3>Custom Tools</h3>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableAlertTool}
-                    onChange={(e) => setEnableAlertTool(e.target.checked)}
-                    disabled={connected || enableGrounding}
-                  />
-                  <label>Show Alert Box</label>
-                </div>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableCssStyleTool}
-                    onChange={(e) => setEnableCssStyleTool(e.target.checked)}
-                    disabled={connected || enableGrounding}
-                  />
-                  <label>Add CSS Style</label>
-                </div>
-              </div>
-
-              <div className="control-group">
-                <h3>Transcription Settings</h3>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableInputTranscription}
-                    onChange={(e) =>
-                      setEnableInputTranscription(e.target.checked)
-                    }
-                    disabled={connected}
-                  />
-                  <label>Enable input transcription</label>
-                </div>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={enableOutputTranscription}
-                    onChange={(e) =>
-                      setEnableOutputTranscription(e.target.checked)
-                    }
-                    disabled={connected}
-                  />
-                  <label>Enable output transcription</label>
-                </div>
-              </div>
-
-              <div className="control-group">
-                <h3>Activity Detection Settings</h3>
-                <div className="checkbox-group">
-                  <input
-                    type="checkbox"
-                    checked={disableActivityDetection}
-                    onChange={(e) =>
-                      setDisableActivityDetection(e.target.checked)
-                    }
-                    disabled={connected}
-                  />
-                  <label>Disable automatic activity detection</label>
-                </div>
-                <div className="input-group">
-                  <label>Silence duration (ms):</label>
-                  <input
-                    type="number"
-                    value={silenceDuration}
-                    onChange={(e) => setSilenceDuration(e.target.value)}
-                    min="500"
-                    max="10000"
-                    step="100"
-                    disabled={connected}
-                  />
-                </div>
-                <div className="input-group">
-                  <label>Prefix padding (ms):</label>
-                  <input
-                    type="number"
-                    value={prefixPadding}
-                    onChange={(e) => setPrefixPadding(e.target.value)}
-                    min="0"
-                    max="2000"
-                    step="100"
-                    disabled={connected}
-                  />
-                </div>
-                <div className="input-group">
-                  <label>End of speech sensitivity:</label>
-                  <select
-                    value={endSpeechSensitivity}
-                    onChange={(e) => setEndSpeechSensitivity(e.target.value)}
-                    disabled={connected}
-                  >
-                    <option value="END_SENSITIVITY_UNSPECIFIED">Default</option>
-                    <option value="END_SENSITIVITY_HIGH">High</option>
-                    <option value="END_SENSITIVITY_LOW">Low</option>
-                  </select>
-                </div>
-                <div className="input-group">
-                  <label>Start of speech sensitivity:</label>
-                  <select
-                    value={startSpeechSensitivity}
-                    onChange={(e) => setStartSpeechSensitivity(e.target.value)}
-                    disabled={connected}
-                  >
-                    <option value="START_SENSITIVITY_UNSPECIFIED">
-                      Default
-                    </option>
-                    <option value="START_SENSITIVITY_HIGH">High</option>
-                    <option value="START_SENSITIVITY_LOW">Low</option>
-                  </select>
-                </div>
-              </div>
-
-              {setupJson && (
-                <div className="control-group">
-                  <h3>Setup Message JSON</h3>
-                  <pre className="setup-json-display">
-                    {JSON.stringify(setupJson, null, 2)}
-                  </pre>
-                </div>
-              )}
+      {!connected ? (
+        <div className="hero">
+          <div className="hero-glow" aria-hidden />
+          <div className="hero-inner">
+            <div className="hero-icon-wrap">
+              <svg className="hero-icon" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden>
+                <path d="M8 32h4l2-8h16l2 8h4v4H8v-4z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                <path d="M14 24h20l-2-8H16l-2 8z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+                <circle cx="16" cy="36" r="3" stroke="currentColor" strokeWidth="2" />
+                <circle cx="32" cy="36" r="3" stroke="currentColor" strokeWidth="2" />
+                <path d="M28 12h8v6h-4z" stroke="currentColor" strokeWidth="2" strokeLinejoin="round" />
+              </svg>
             </div>
+            <div className="hero-badge">9 steps</div>
+            <h1 className="hero-title">Truck Inspection</h1>
+            <p className="hero-subtitle">
+              Point your camera at each part. The assistant guides you and marks pass or fail as you go.
+            </p>
+            <button
+              type="button"
+              onClick={connect}
+              className="button-connect button-connect--hero"
+            >
+              <span className="button-connect-label">Start inspection</span>
+              <svg className="button-connect-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                <path d="M5 12h14M13 6l6 6-6 6" strokeLinecap="round" strokeLinejoin="round" />
+              </svg>
+            </button>
           </div>
-
-          <div className="dropdown">
-            <button className="dropbtn">Media ▾</button>
-            <div className="dropdown-content media-dropdown">
-              {/* Media Streaming Section */}
-              <div className="control-group">
-                <div className="input-group">
-                  <label>Microphone:</label>
-                  <select
-                    value={selectedMic}
-                    onChange={(e) => setSelectedMic(e.target.value)}
-                  >
-                    <option value="">Default Microphone</option>
-                    {audioInputDevices.map((device) => (
-                      <option key={device.deviceId} value={device.deviceId}>
-                        {device.label || `Microphone ${device.deviceId}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="input-group">
-                  <label>Camera:</label>
-                  <select
-                    value={selectedCamera}
-                    onChange={(e) => setSelectedCamera(e.target.value)}
-                  >
-                    <option value="">Default Camera</option>
-                    {videoInputDevices.map((device) => (
-                      <option key={device.deviceId} value={device.deviceId}>
-                        {device.label || `Camera ${device.deviceId}`}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="button-group-vertical">
-                  <button
-                    onClick={toggleAudio}
-                    className={audioStreaming ? "active" : ""}
-                  >
-                    {audioStreaming ? "Stop Audio" : "Start Audio"}
-                  </button>
-                  <button
-                    onClick={toggleVideo}
-                    className={videoStreaming ? "active" : ""}
-                  >
-                    {videoStreaming ? "Stop Video" : "Start Video"}
-                  </button>
-                  <button
-                    onClick={toggleScreen}
-                    className={screenSharing ? "active" : ""}
-                  >
-                    {screenSharing ? "Stop Sharing" : "Share Screen"}
-                  </button>
-                </div>
-
-                <div className="input-group">
-                  <label>Output volume: {volume}%</label>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={volume}
-                    onChange={handleVolumeChange}
-                  />
-                </div>
-
-                <video
-                  ref={videoPreviewRef}
-                  autoPlay
-                  playsInline
-                  muted
-                  hidden
-                  className="video-preview"
-                />
-              </div>
-            </div>
-          </div>
-
         </div>
-        <div className="chat-section">
-          <div className="chat-container" ref={chatContainerRef}>
-            {chatMessages.length === 0 && (
-              <div className="chat-empty">Connect to Gemini to start chatting</div>
-            )}
-            {chatMessages.map((msg, index) => (
-              <div key={index} className={`message ${msg.type}`}>
-                {msg.text}
+      ) : (
+        <div className="main-screen main-screen--active">
+          <header className="header-bar">
+            <div className="header-bar-left">
+              <div className="header-bar-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden>
+                  <path d="M4 18h2l1-5h10l1 5h2v2H4v-2z" strokeLinejoin="round" />
+                  <circle cx="8" cy="20" r="1.5" />
+                  <circle cx="16" cy="20" r="1.5" />
+                  <path d="M6 13h12l-1-4H7l-1 4z" strokeLinejoin="round" />
+                </svg>
               </div>
-            ))}
-          </div>
-          <div className="chat-input-area">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyPress={(e) => e.key === "Enter" && sendMessage()}
-              placeholder="Type a message..."
+              <div>
+                <h1 className="header-bar-title">Truck Inspection</h1>
+                <p className="header-bar-meta">Step {Math.min(inspectionStep + 1, INSPECTION_CHECKLIST.length)} of {INSPECTION_CHECKLIST.length}</p>
+              </div>
+            </div>
+            <span className="live-pill">
+              <span className="live-pill-dot" />
+              Live
+            </span>
+          </header>
+
+          <div className="inspection-camera">
+            <video
+              ref={videoPreviewRef}
+              autoPlay
+              playsInline
+              muted
+              className="video-preview inspection-video"
             />
-            <button onClick={sendMessage}>Send</button>
+          </div>
+          <div className="checklist-table">
+            <div className="checklist-table-header">
+              <span>#</span>
+              <span>Item</span>
+              <span>Status</span>
+            </div>
+            {INSPECTION_CHECKLIST.map((item, i) => {
+              const result = inspectionResults[i];
+              const isCurrent = i === inspectionStep && !inspectionComplete;
+              const status = result ? (result.pass ? "pass" : "fail") : isCurrent ? "current" : "pending";
+              const statusLabel = result ? (result.pass ? "Pass" : "Fail") : isCurrent ? "..." : "—";
+              return (
+                <div key={item.id} className={`checklist-row checklist-row--${status}`}>
+                  <span className="checklist-num">{i + 1}</span>
+                  <span className="checklist-name">{item.name}</span>
+                  <span className={`checklist-status checklist-status--${status}`}>{statusLabel}</span>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="footer-cta">
+            <button type="button" onClick={disconnect} className="button-connect disconnect">
+              End inspection
+            </button>
           </div>
         </div>
-      </div>
+      )}
     </div>
   );
 };

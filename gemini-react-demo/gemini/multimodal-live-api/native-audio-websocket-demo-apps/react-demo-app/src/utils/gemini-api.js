@@ -409,7 +409,7 @@ export class GeminiLiveAPI {
   }
 
   sendAudioMessage(base64PCM) {
-    this.sendRealtimeInputMessage(base64PCM, "audio/pcm");
+    this.sendRealtimeInputMessage(base64PCM, "audio/pcm;rate=16000");
   }
 
   async sendImageMessage(base64Image, mime_type = "image/jpeg") {
